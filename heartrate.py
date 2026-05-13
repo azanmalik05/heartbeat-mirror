@@ -15,11 +15,27 @@ from serial.tools import list_ports
 
 BAUD = 9600
 READ_INTERVAL_MS = 100
-BPM_LINE_RE = re.compile(r"BPM:\s*([0-9]+(?:\.[0-9]+)?)\s*\|\s*Avg BPM:\s*([0-9]+)")
+BPM_LINE_RE = re.compile(
+    r"BPM:\s*([0-9]+(?:\.[0-9]+)?)\s*\|\s*Avg BPM:\s*([0-9]+)"
+    r"(?:\s*\|\s*Guess:\s*([0-9]+))?(?:\s*\|\s*Confidence:\s*([0-9]+)/([0-9]+))?"
+)
+NO_FINGER_RE = re.compile(r"No finger detected(?:\s*\|\s*Guess:\s*([0-9]+))?")
+CALIBRATING_RE = re.compile(
+    r"Calibrating(?:\s*\|\s*Guess:\s*([0-9]+))?(?:\s*\|\s*Confidence:\s*([0-9]+)/([0-9]+))?"
+)
+MISSING_HEART_RE = re.compile(
+    r"(?:MAX30102 not found\. Check wiring\.|I2C bus stuck low\. Check SDA and SCL wiring\.)"
+    r"(?:\s*\|\s*Guess:\s*([0-9]+))?"
+    r"(?:\s*\|\s*NeoSlider:\s*(found|not found))?"
+)
+SLIDER_STATUS_RE = re.compile(r".*\|\s*NeoSlider:\s*(found|not found)")
 
 LOW_BPM = 60
 HIGH_BPM = 100
+MIN_GUESS_BPM = 45
+MAX_GUESS_BPM = 190
 NO_FINGER_TIMEOUT_MS = 3500
+SERIAL_SILENCE_TIMEOUT_MS = 6500
 
 APP_DIR = Path(__file__).resolve().parent
 MEDIA_DIR = APP_DIR / "media"
@@ -27,7 +43,7 @@ MEDIA_DIR = APP_DIR / "media"
 STATE_CONFIG = {
     "waiting": {
         "title": "Touch the sensor",
-        "subtitle": "Put one finger on the glowing sensor.",
+        "subtitle": "Move the slider to guess, then put one finger on the glowing sensor.",
         "emoji": "♡",
         "color": "#64748b",
         "bg": "#f8fafc",
@@ -37,6 +53,15 @@ STATE_CONFIG = {
     "busy": {
         "title": "Sensor is busy",
         "subtitle": "Close Serial Monitor, then press reconnect.",
+        "emoji": "!",
+        "color": "#d97706",
+        "bg": "#fffbeb",
+        "sound": None,
+        "gif": "waiting.gif",
+    },
+    "missing": {
+        "title": "Check the wires",
+        "subtitle": "The Arduino is connected, but the heart sensor is not responding.",
         "emoji": "!",
         "color": "#d97706",
         "bg": "#fffbeb",
@@ -191,12 +216,16 @@ class HeartRateApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Heartbeat Mirror")
-        self.root.geometry("760x560")
-        self.root.minsize(620, 500)
+        self.root.geometry("760x650")
+        self.root.minsize(620, 590)
 
         self.ser = None
         self.current_state = None
         self.last_bpm = None
+        self.last_guess = None
+        self.connected_at = None
+        self.last_serial_at = None
+        self.last_serial_line = None
         self.last_read_at = None
         self.last_beat_at = 0
         self.pulse_size = 1.0
@@ -257,6 +286,52 @@ class HeartRateApp:
         )
         self.bpm_label.pack()
 
+        self.guess_frame = tk.Frame(root, bg=STATE_CONFIG["waiting"]["bg"])
+        self.guess_frame.pack(fill="x", padx=52, pady=(14, 6))
+
+        self.guess_title = tk.Label(
+            self.guess_frame,
+            text="Guess the heartbeat first",
+            font=("Arial", 16, "bold"),
+            fg="#334155",
+            bg=STATE_CONFIG["waiting"]["bg"],
+        )
+        self.guess_title.pack(anchor="w")
+
+        self.guess_var = tk.IntVar(value=90)
+        self.guess_scale = tk.Scale(
+            self.guess_frame,
+            from_=MIN_GUESS_BPM,
+            to=MAX_GUESS_BPM,
+            orient="horizontal",
+            variable=self.guess_var,
+            showvalue=False,
+            length=560,
+            state="disabled",
+            bg=STATE_CONFIG["waiting"]["bg"],
+            troughcolor="#e2e8f0",
+            highlightthickness=0,
+        )
+        self.guess_scale.pack(fill="x")
+
+        self.guess_label = tk.Label(
+            self.guess_frame,
+            text="Guess: 90 BPM",
+            font=("Arial", 15),
+            fg="#475569",
+            bg=STATE_CONFIG["waiting"]["bg"],
+        )
+        self.guess_label.pack(anchor="w")
+
+        self.compare_label = tk.Label(
+            root,
+            text="",
+            font=("Arial", 17, "bold"),
+            fg="#0f172a",
+            bg=STATE_CONFIG["waiting"]["bg"],
+        )
+        self.compare_label.pack(pady=(2, 0))
+
         controls = tk.Frame(root, bg=STATE_CONFIG["waiting"]["bg"])
         controls.pack(pady=(12, 16))
 
@@ -315,8 +390,11 @@ class HeartRateApp:
 
         try:
             self.ser = serial.Serial(port, BAUD, timeout=0.1)
+            self.connected_at = self._now_ms()
+            self.last_serial_at = None
             self.status_label.config(text=f"Sensor connected: {port}")
             self.set_state("waiting")
+            self.root.after(1200, self.request_arduino_start)
         except Exception as e:
             self.ser = None
             if getattr(e, "errno", None) == 16 or "Resource busy" in str(e):
@@ -326,35 +404,109 @@ class HeartRateApp:
                 self.status_label.config(text=f"Could not connect to sensor: {e}")
                 self.set_state("waiting")
 
+    def request_arduino_start(self):
+        if not self.ser or not self.ser.is_open:
+            return
+
+        try:
+            self.ser.write(b"S\n")
+        except Exception:
+            self.status_label.config(text="Could not start Arduino hardware check")
+
     def read_loop(self):
         if self.ser and self.ser.is_open:
             try:
                 line = self.ser.readline().decode(errors="ignore").strip()
-                if line == "No finger detected":
+                if line:
+                    self.last_serial_at = self._now_ms()
+                    self.last_serial_line = line
+
+                no_finger = NO_FINGER_RE.match(line)
+                if no_finger:
+                    self.update_guess(no_finger.group(1))
+                    self.update_slider_status(line)
                     self.last_bpm = None
                     self.last_read_at = None
-                    self.status_label.config(text="Waiting for a finger")
+                    self.status_label.config(text="Make your guess, then touch the sensor")
                     self.set_state("waiting")
                     self.bpm_label.config(text="-- BPM")
+                    self.compare_label.config(text="")
                 else:
+                    missing_heart = MISSING_HEART_RE.match(line)
+                    if missing_heart:
+                        self.update_guess(missing_heart.group(1))
+                        self.update_slider_status(line)
+                        self.last_bpm = None
+                        self.last_read_at = None
+                        slider_message = self.slider_status_message(line)
+                        self.status_label.config(text=f"Heart sensor not found{slider_message}")
+                        self.bpm_label.config(text="-- BPM")
+                        self.compare_label.config(text="")
+                        self.set_state("missing")
+                        self.root.after(READ_INTERVAL_MS, self.read_loop)
+                        return
+
+                    calibrating = CALIBRATING_RE.match(line)
+                    if calibrating:
+                        self.update_guess(calibrating.group(1))
+                        self.update_slider_status(line)
+                        self.last_bpm = None
+                        self.last_read_at = self._now_ms()
+                        confidence = self._confidence_text(calibrating.group(2), calibrating.group(3))
+                        self.status_label.config(text=f"Finding your heartbeat{confidence}")
+                        self.bpm_label.config(text="-- BPM")
+                        self.compare_label.config(text="")
+                        self.set_state("waiting")
+                        self.root.after(READ_INTERVAL_MS, self.read_loop)
+                        return
+
                     m = BPM_LINE_RE.match(line)
                     if m:
                         bpm = int(float(m.group(1)))
                         avg = int(m.group(2))
+                        self.update_guess(m.group(3))
+                        self.update_slider_status(line)
                         display_bpm = avg if avg > 0 else bpm
                         self.last_bpm = display_bpm
                         self.last_read_at = self._now_ms()
-                        self.status_label.config(text="Reading your heartbeat")
+                        confidence = self._confidence_text(m.group(4), m.group(5))
+                        self.status_label.config(text=f"Reading your heartbeat{confidence}")
                         self.bpm_label.config(text=f"{display_bpm} BPM")
+                        self.update_comparison(display_bpm)
                         self.set_state(self.state_for_bpm(display_bpm))
+                    elif line:
+                        self.show_raw_arduino_line(line)
             except Exception:
                 self.status_label.config(text="Read error. Try reconnecting.")
+
+        if (
+            self.ser
+            and self.ser.is_open
+            and self.connected_at
+            and not self.last_serial_at
+            and self._now_ms() - self.connected_at > SERIAL_SILENCE_TIMEOUT_MS
+        ):
+            self.set_state("missing")
+            self.status_label.config(text="Arduino USB found, but no sketch data is coming in")
+            self.subtitle_label.config(text="Upload heart_monitor.ino, close Serial Monitor, then press reconnect.")
+
+        if (
+            self.ser
+            and self.ser.is_open
+            and self.last_serial_at
+            and not self.last_read_at
+            and self._now_ms() - self.last_serial_at > SERIAL_SILENCE_TIMEOUT_MS
+        ):
+            self.set_state("missing")
+            self.status_label.config(text=f"Arduino stopped after: {self.last_serial_line[:60]}")
+            self.subtitle_label.config(text="Check I2C wiring: power, ground, SDA, and SCL.")
 
         if self.last_read_at and self._now_ms() - self.last_read_at > NO_FINGER_TIMEOUT_MS:
             self.last_bpm = None
             self.last_read_at = None
             self.set_state("waiting")
             self.bpm_label.config(text="-- BPM")
+            self.compare_label.config(text="")
 
         self.root.after(READ_INTERVAL_MS, self.read_loop)
 
@@ -382,6 +534,11 @@ class HeartRateApp:
             self.title_label,
             self.subtitle_label,
             self.bpm_label,
+            self.guess_frame,
+            self.guess_title,
+            self.guess_scale,
+            self.guess_label,
+            self.compare_label,
             self.sound_btn.master,
             self.sound_btn,
         ]:
@@ -398,12 +555,66 @@ class HeartRateApp:
             self.media_label.place_forget()
             self.canvas.place(relx=0.5, rely=0.46, anchor="center")
 
+    def update_guess(self, value):
+        if value is None:
+            return
+
+        self.last_guess = int(value)
+        self.guess_var.set(self.last_guess)
+        self.guess_label.config(text=f"Guess: {self.last_guess} BPM")
+
+    def update_comparison(self, bpm: int):
+        if self.last_guess is None:
+            self.compare_label.config(text="")
+            return
+
+        difference = abs(self.last_guess - bpm)
+        if difference == 0:
+            message = "Perfect guess"
+        elif difference <= 5:
+            message = f"Only {difference} BPM away"
+        else:
+            message = f"{difference} BPM away from the guess"
+        self.compare_label.config(text=message)
+
+    def update_slider_status(self, line: str):
+        slider_status = SLIDER_STATUS_RE.match(line)
+        if slider_status and slider_status.group(1) == "not found":
+            self.guess_label.config(text=f"{self.guess_label.cget('text')} - slider not found")
+
+    def slider_status_message(self, line: str) -> str:
+        slider_status = SLIDER_STATUS_RE.match(line)
+        if slider_status and slider_status.group(1) == "not found":
+            return "; NeoSlider not found"
+        return ""
+
+    def show_raw_arduino_line(self, line: str):
+        if line.startswith("I2C MAX30102") or line.startswith("I2C NeoSlider"):
+            self.status_label.config(text=line)
+            return
+
+        if line == "Heartbeat Mirror starting.":
+            self.status_label.config(text="Arduino sketch started")
+            return
+
+        self.status_label.config(text=f"Arduino says: {line[:80]}")
+
+    def _confidence_text(self, count, total):
+        if not count or not total:
+            return ""
+
+        count = int(count)
+        total = int(total)
+        if count < total:
+            return f" - calibrating {count}/{total}"
+        return " - calibrated"
+
     def animation_loop(self):
         bpm = self.last_bpm or 54
         beat_interval_ms = max(280, min(1300, int(60000 / bpm)))
         now = self._now_ms()
 
-        if self.current_state not in {"waiting", "busy"} and now - self.last_beat_at >= beat_interval_ms:
+        if self.current_state not in {"waiting", "busy", "missing"} and now - self.last_beat_at >= beat_interval_ms:
             self.last_beat_at = now
             self.pulse_size = 1.2
             self.sound.play(self.current_state)
@@ -443,7 +654,7 @@ class HeartRateApp:
             )
             return
 
-        if self.current_state == "busy":
+        if self.current_state in {"busy", "missing"}:
             self.canvas.create_oval(105, 64, 255, 214, outline=color, width=5)
             self.canvas.create_text(
                 cx,
@@ -455,7 +666,7 @@ class HeartRateApp:
             self.canvas.create_text(
                 cx,
                 224,
-                text="Close Serial Monitor",
+                text="Check SDA SCL power ground" if self.current_state == "missing" else "Close Serial Monitor",
                 font=("Arial", 18, "bold"),
                 fill="#334155",
             )
