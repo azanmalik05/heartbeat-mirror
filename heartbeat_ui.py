@@ -15,6 +15,9 @@ ELEVATED_HEARTBEAT_THRESHOLD = 95
 SLIDER_MIN_BPM = 40
 SLIDER_MAX_BPM = 140
 
+# Finger on the sensor yields much higher IR than "No finger" lines (~2k vs ~250k in typical logs).
+FINGER_IR_THRESHOLD = 15000
+
 guess_bpm = "--"
 avg_bpm = "--"
 difference = "--"
@@ -298,6 +301,7 @@ def play_video(path):
         video_status_label.config(text=f"Could not open monitor media: {path}", fg=COLORS["coral"])
         return
 
+    video_label.config(text="", compound="none")
     start_audio(path)
     video_playback_token += 1
     render_video_frame(video_playback_token)
@@ -326,6 +330,37 @@ def stop_audio():
         audio_process.terminate()
 
     audio_process = None
+
+
+def pause_monitor_display():
+    """Stop frames, audio, and clear the monitor when finger is off the sensor."""
+    global video_after_id, video_capture, video_playback_token, current_video_path, video_photo
+
+    if video_after_id is not None:
+        root.after_cancel(video_after_id)
+        video_after_id = None
+
+    if video_capture is not None:
+        video_capture.release()
+        video_capture = None
+
+    current_video_path = None
+    video_playback_token += 1
+    stop_audio()
+
+    video_photo = None
+    video_label.config(
+        image="",
+        text="No signal\nPlace finger on sensor",
+        fg=COLORS["muted"],
+        font=("Avenir Next", 18, "bold"),
+        compound="center",
+    )
+    video_pill.config(text="WAITING FOR SENSOR", fg=COLORS["deep"], bg=COLORS["yellow"])
+    video_status_label.config(
+        text="The monitor responds live as your heartbeat changes.",
+        fg=COLORS["muted"],
+    )
 
 
 def render_video_frame(token):
@@ -357,7 +392,7 @@ def render_video_frame(token):
             canvas.paste(frame_image, (x, y))
 
             video_photo = ImageTk.PhotoImage(canvas)
-            video_label.config(image=video_photo)
+            video_label.config(image=video_photo, text="", compound="none")
 
         fps = video_capture.get(cv2.CAP_PROP_FPS)
         delay = int(1000 / fps) if fps and fps > 1 else 33
@@ -400,6 +435,50 @@ def extract_field_value(line, field_name):
 
     value = line.split(field_name, 1)[1].strip()
     return value.split("|", 1)[0].strip()
+
+
+def extract_ir_from_line(line):
+    if "IR:" not in line:
+        return None
+    fragment = line.split("IR:", 1)[1].strip()
+    if not fragment:
+        return None
+    number_chars = []
+    for ch in fragment:
+        if ch.isdigit():
+            number_chars.append(ch)
+        elif number_chars:
+            break
+    if not number_chars:
+        return None
+    try:
+        return int("".join(number_chars))
+    except ValueError:
+        return None
+
+
+def show_calibrating_feedback():
+    result_label.config(text="Firing up…", fg=COLORS["sky"])
+    status_label.config(
+        text="Keep your finger on the sensor. Calibrating and locking onto your pulse—numbers will appear in a moment.",
+        fg=COLORS["soft"],
+    )
+
+
+def show_place_finger_feedback():
+    result_label.config(text="Ready when you are!", fg=COLORS["white"])
+    status_label.config(text="Place your finger on the sensor.", fg=COLORS["soft"])
+
+
+def apply_no_finger_state_ui():
+    """Finger removed: clear pulse readouts and stop the monitor until the next reading."""
+    global last_video
+
+    last_video = None
+    measured_label.config(text=f"{avg_bpm} BPM")
+    difference_label.config(text=f"{difference} BPM")
+    show_place_finger_feedback()
+    pause_monitor_display()
 
 
 def update_slider_indicator(value):
@@ -544,7 +623,19 @@ def read_serial():
                 root.after(0, update_full_ui)
 
             elif "No finger" in line:
-                root.after(0, lambda: status_label.config(text="Place your finger on the sensor."))
+                avg_bpm = "--"
+                difference = "--"
+                root.after(0, apply_no_finger_state_ui)
+            else:
+                ir_value = extract_ir_from_line(line)
+                finger_likely = ir_value is not None and ir_value >= FINGER_IR_THRESHOLD
+                partial_bpm = (
+                    "Guess:" in line
+                    and "Avg BPM:" not in line
+                    and "No finger" not in line
+                )
+                if finger_likely or partial_bpm:
+                    root.after(0, show_calibrating_feedback)
 
         except Exception as e:
             root.after(0, lambda: status_label.config(text=f"Read error: {e}"))
